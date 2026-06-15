@@ -1,0 +1,33 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "WAVIoT meter",
+        "data": {
+          "api_key": "API key",
+          "modem_id": "Modem ID (HEX)",
+          "base_url": "Base URL"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid API key or no access to this modem",
+      "cannot_connect": "Failed to connect to WAVIoT API"
+    },
+    "abort": {
+      "already_configured": "This modem is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "WAVIoT options",
+        "data": {
+          "channels": "Channels (comma-separated, empty = auto-discover)",
+          "import_statistics": "Import hourly history into long-term statistics",
+          "prices": "Prices (e.g. t1=6.97,t2=3.86)"
+        }
+      }
+    }
+  }
+}

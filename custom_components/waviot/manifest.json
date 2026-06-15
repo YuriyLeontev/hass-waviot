@@ -1,0 +1,13 @@
+{
+  "domain": "waviot",
+  "name": "WAVIoT",
+  "codeowners": ["@YuriyLeontev"],
+  "config_flow": true,
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/YuriyLeontev/hass-waviot",
+  "issue_tracker": "https://github.com/YuriyLeontev/hass-waviot/issues",
+  "integration_type": "device",
+  "iot_class": "cloud_polling",
+  "requirements": [],
+  "version": "1.0.5"
+}
