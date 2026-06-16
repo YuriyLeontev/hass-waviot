@@ -172,13 +172,11 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         data["battery"] = _to_float(modem.get("battery"))
         data["temperature"] = _to_float(modem.get("temperature"))
-        # "Last seen" = newest of all timestamps the meter exposes. Any single
-        # field can lag or be null, so take the max instead of a fixed order.
-        last_seen_candidates = [
-            _to_dt(modem.get("last_station_time")),
-            _to_dt(modem.get("last_info_message")),
-            _to_dt(modem.get("last_config_time")),
-        ]
+        data["last_seen"] = _to_dt(modem.get("last_station_time")) or _to_dt(
+            modem.get("last_info_message")
+        )
+        # Newest actual meter-reading time is tracked separately (attribute only).
+        reading_times: list[datetime | None] = []
 
         if not self._channels_discovered:
             self.channels = await self._discover_channels()
@@ -207,7 +205,7 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "value": last_val,
                     "ts": reading_dt,
                 }
-                last_seen_candidates.append(reading_dt)
+                reading_times.append(reading_dt)
             else:
                 data["channels"][channel] = {"value": None, "ts": None}
 
@@ -219,8 +217,8 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "Failed to import statistics for channel %s", channel
                     )
 
-        seen = [d for d in last_seen_candidates if d is not None]
-        data["last_seen"] = max(seen) if seen else None
+        reads = [d for d in reading_times if d is not None]
+        data["last_reading"] = max(reads) if reads else None
         return data
 
     # ------------------------------------------------------------------ #

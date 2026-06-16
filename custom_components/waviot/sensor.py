@@ -121,3 +121,8 @@ class WaviotLastSeenSensor(WaviotBaseSensor):
     @property
     def native_value(self) -> datetime | None:
         return self.coordinator.data.get("last_seen")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        reading: datetime | None = self.coordinator.data.get("last_reading")
+        return {"last_reading": reading.isoformat() if reading else None}
