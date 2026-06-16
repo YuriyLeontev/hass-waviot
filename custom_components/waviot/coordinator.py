@@ -8,6 +8,14 @@ from typing import Any
 
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import StatisticData, StatisticMetaData
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+    get_last_statistics,
+)
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfEnergy
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 try:  # HA 2025.x+: mean_type replaces has_mean
     from homeassistant.components.recorder.models import StatisticMeanType
@@ -30,14 +38,6 @@ def _statistic_meta_keys() -> set[str]:
 
 
 _UNIT_CLASS_SUPPORTED = "unit_class" in _statistic_meta_keys()
-from homeassistant.components.recorder.statistics import (
-    async_add_external_statistics,
-    get_last_statistics,
-)
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfEnergy
-from homeassistant.core import HomeAssistant
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import WaviotApiClient, WaviotApiError, WaviotAuthError
 from .const import (
@@ -67,12 +67,14 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         client: WaviotApiClient,
         modem_id: str,
     ) -> None:
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=f"WAVIoT {modem_id}",
-            update_interval=timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MIN),
-        )
+        coordinator_kwargs: dict[str, Any] = {
+            "name": f"WAVIoT {modem_id}",
+            "update_interval": timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MIN),
+        }
+        try:
+            super().__init__(hass, _LOGGER, config_entry=entry, **coordinator_kwargs)
+        except TypeError:
+            super().__init__(hass, _LOGGER, **coordinator_kwargs)
         self.entry = entry
         self.client = client
         self.modem_id = modem_id

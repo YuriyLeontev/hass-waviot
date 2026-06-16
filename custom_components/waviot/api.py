@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 from typing import Any
 
 import aiohttp
@@ -35,9 +36,17 @@ class WaviotApiClient:
         url = f"{self._base_url}/api.{api_type}/{method}/"
         params = {k: v for k, v in params.items() if v is not None}
         params["key"] = self._api_key
+        # Cache-buster: modem_info is requested with identical params every
+        # poll, so a shared session / upstream proxy may serve a stale cached
+        # response (the meter's last_station_time would appear "frozen" until
+        # HA restart). A unique _ value + no-cache headers force a fresh fetch.
+        params["_"] = int(datetime.now().timestamp() * 1000)
+        headers = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
         try:
             async with asyncio.timeout(30):
-                async with self._session.get(url, params=params) as resp:
+                async with self._session.get(
+                    url, params=params, headers=headers
+                ) as resp:
                     if resp.status in (401, 403):
                         raise WaviotAuthError(f"HTTP {resp.status} for {url}")
                     resp.raise_for_status()
