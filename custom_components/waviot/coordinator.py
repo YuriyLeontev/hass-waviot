@@ -174,10 +174,16 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         data["battery"] = _to_float(modem.get("battery"))
         data["temperature"] = _to_float(modem.get("temperature"))
-        data["last_seen"] = _to_dt(modem.get("last_station_time")) or _to_dt(
+        station_dt = _to_dt(modem.get("last_station_time")) or _to_dt(
             modem.get("last_info_message")
         )
-        # Newest actual meter-reading time is tracked separately (attribute only).
+        _LOGGER.debug(
+            "WAVIoT %s poll: last_station_time=%s battery=%s temp=%s",
+            self.modem_id,
+            modem.get("last_station_time"),
+            modem.get("battery"),
+            modem.get("temperature"),
+        )
         reading_times: list[datetime | None] = []
 
         if not self._channels_discovered:
@@ -220,7 +226,9 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
 
         reads = [d for d in reading_times if d is not None]
-        data["last_reading"] = max(reads) if reads else None
+        last_reading = max(reads) if reads else None
+        data["last_reading"] = last_reading
+        data["last_seen"] = last_reading or station_dt
         return data
 
     # ------------------------------------------------------------------ #
