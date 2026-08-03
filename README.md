@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/hacs/integration"><img src="https://img.shields.io/badge/HACS-Custom-41BDF5.svg" alt="HACS Custom"></a>
-  <img src="https://img.shields.io/badge/HA-2024.1%2B-blue.svg" alt="HA 2024.1+">
+  <img src="https://img.shields.io/badge/HA-2024.11%2B-blue.svg" alt="HA 2024.11+">
   <img src="https://img.shields.io/badge/iot__class-cloud__polling-green.svg" alt="cloud polling">
 </p>
 

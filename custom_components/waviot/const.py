@@ -17,6 +17,9 @@ DEFAULT_UPDATE_INTERVAL_MIN = 30
 FETCH_WINDOW_DAYS = 7
 # On the very first refresh we backfill this much history into HA statistics.
 BACKFILL_DAYS = 365
+# The backfill is fetched in windows of this size: a single year-long request
+# is slow and trips server-side rate limits.
+BACKFILL_CHUNK_DAYS = 30
 
 # Candidate energy channels probed automatically (WAVIoT FOBOS electricity
 # meters). Channels that return no data are silently skipped.

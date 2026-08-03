@@ -15,6 +15,7 @@ from homeassistant.components.recorder.statistics import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 try:  # HA 2025.x+: mean_type replaces has_mean
@@ -41,6 +42,7 @@ _UNIT_CLASS_SUPPORTED = "unit_class" in _statistic_meta_keys()
 
 from .api import WaviotApiClient, WaviotApiError, WaviotAuthError
 from .const import (
+    BACKFILL_CHUNK_DAYS,
     BACKFILL_DAYS,
     CHANNEL_NAMES,
     CONF_PRICES,
@@ -49,7 +51,6 @@ from .const import (
     CONF_IMPORT_STATISTICS,
     DEFAULT_ENERGY_CHANNELS,
     DEFAULT_UPDATE_INTERVAL_MIN,
-    DOMAIN,
     FETCH_WINDOW_DAYS,
     STATISTICS_SOURCE,
 )
@@ -71,10 +72,7 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "name": f"WAVIoT {modem_id}",
             "update_interval": timedelta(minutes=DEFAULT_UPDATE_INTERVAL_MIN),
         }
-        try:
-            super().__init__(hass, _LOGGER, config_entry=entry, **coordinator_kwargs)
-        except TypeError:
-            super().__init__(hass, _LOGGER, **coordinator_kwargs)
+        super().__init__(hass, _LOGGER, config_entry=entry, **coordinator_kwargs)
         self.entry = entry
         self.client = client
         self.modem_id = modem_id
@@ -168,7 +166,7 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             modem = await self.client.modem_info(self.modem_id)
         except WaviotAuthError as err:
-            raise UpdateFailed(f"Authentication failed: {err}") from err
+            raise ConfigEntryAuthFailed(f"Authentication failed: {err}") from err
         except WaviotApiError as err:
             raise UpdateFailed(str(err)) from err
 
@@ -218,11 +216,16 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 data["channels"][channel] = {"value": None, "ts": None}
 
             if import_stats:
+                # Only API trouble is tolerated here: a failing channel must
+                # not kill the poll, but anything else has to surface instead
+                # of being swallowed poll after poll.
                 try:
                     await self._async_import_statistics(channel, values)
-                except Exception:  # noqa: BLE001 - stats must never kill updates
-                    _LOGGER.exception(
-                        "Failed to import statistics for channel %s", channel
+                except WaviotApiError as err:
+                    _LOGGER.warning(
+                        "Failed to import statistics for channel %s: %s",
+                        channel,
+                        err,
                     )
 
         reads = [d for d in reading_times if d is not None]
@@ -261,6 +264,46 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 _LOGGER.warning("Ignoring invalid price entry: %s", pair)
         return prices
 
+    async def _fetch_backfill(self, channel: str) -> dict[int, float]:
+        """Fetch up to BACKFILL_DAYS of history for one channel.
+
+        Queried in BACKFILL_CHUNK_DAYS windows, newest first: a single
+        year-long request is slow and trips server-side rate limits. Windows
+        that fail are logged and skipped; whatever was collected is still
+        usable, and an empty result makes the caller retry on the next poll.
+        """
+        now = int(datetime.now(tz=timezone.utc).timestamp())
+        oldest = now - BACKFILL_DAYS * 86400
+        collected: dict[int, float] = {}
+
+        window_to = now
+        while window_to > oldest:
+            window_from = max(oldest, window_to - BACKFILL_CHUNK_DAYS * 86400)
+            try:
+                chunk = await self.client.channel_values(
+                    self.modem_id, channel, ts_from=window_from, ts_to=window_to
+                )
+            except WaviotApiError as err:
+                _LOGGER.warning(
+                    "Backfill of channel %s (%s..%s) failed: %s",
+                    channel,
+                    datetime.fromtimestamp(window_from, tz=timezone.utc).date(),
+                    datetime.fromtimestamp(window_to, tz=timezone.utc).date(),
+                    err,
+                )
+            else:
+                collected.update(chunk)
+            await asyncio.sleep(0.5)  # be gentle with the API
+            window_to = window_from
+
+        _LOGGER.info(
+            "WAVIoT %s: backfill of channel %s collected %d readings",
+            self.modem_id,
+            channel,
+            len(collected),
+        )
+        return collected
+
     async def _async_import_statistics(
         self, channel: str, recent_values: dict[int, float]
     ) -> None:
@@ -293,8 +336,11 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         values = recent_values
         if need_backfill and channel not in self._stats_backfilled:
-            values = await self._fetch_backfill(channel)
-            self._stats_backfilled.add(channel)
+            history = await self._fetch_backfill(channel)
+            if history:
+                # Recent values win: they are the freshest read of the meter.
+                values = {**history, **recent_values}
+                self._stats_backfilled.add(channel)
 
         # Collapse readings to one per hour (last reading inside the hour).
         hourly: dict[datetime, float] = {}

@@ -8,6 +8,13 @@
           "modem_id": "ID модема (HEX)",
           "base_url": "Базовый URL"
         }
+      },
+      "reauth_confirm": {
+        "title": "Повторная авторизация WAVIoT",
+        "description": "API-ключ для модема {modem_id} больше не принимается. Введите новый ключ.",
+        "data": {
+          "api_key": "API-ключ"
+        }
       }
     },
     "error": {
@@ -15,7 +22,8 @@
       "cannot_connect": "Не удалось подключиться к API WAVIoT"
     },
     "abort": {
-      "already_configured": "Этот модем уже настроен"
+      "already_configured": "Этот модем уже настроен",
+      "reauth_successful": "Повторная авторизация выполнена успешно"
     }
   },
   "options": {

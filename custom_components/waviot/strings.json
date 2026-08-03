@@ -8,6 +8,13 @@
           "modem_id": "Modem ID (HEX)",
           "base_url": "Base URL"
         }
+      },
+      "reauth_confirm": {
+        "title": "Re-authenticate with WAVIoT",
+        "description": "The API key for modem {modem_id} is no longer accepted. Enter a new key.",
+        "data": {
+          "api_key": "API key"
+        }
       }
     },
     "error": {
@@ -15,7 +22,8 @@
       "cannot_connect": "Failed to connect to WAVIoT API"
     },
     "abort": {
-      "already_configured": "This modem is already configured"
+      "already_configured": "This modem is already configured",
+      "reauth_successful": "Re-authentication was successful"
     }
   },
   "options": {

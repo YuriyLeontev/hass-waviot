@@ -15,14 +15,17 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from . import WaviotConfigEntry
 from .const import CHANNEL_NAMES, DOMAIN
 from .coordinator import WaviotCoordinator
 
 
 async def async_setup_entry(
-    hass: HomeAssistant, entry, async_add_entities: AddEntitiesCallback
+    hass: HomeAssistant,
+    entry: WaviotConfigEntry,
+    async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: WaviotCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinator = entry.runtime_data
 
     entities: list[SensorEntity] = [
         WaviotEnergySensor(coordinator, channel) for channel in coordinator.channels
