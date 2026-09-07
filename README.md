@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="images/icon.png" width="120" alt="WAVIoT">
+  <img src="https://raw.githubusercontent.com/YuriyLeontev/hass-waviot/main/images/icon.png" width="120" alt="WAVIoT">
 </p>
 
 <h1 align="center">WAVIoT → Home Assistant</h1>
