@@ -98,6 +98,9 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # them in the current poll (see _async_rebuild_cost).
         self._cost_rebuild: set[str] = set()
         self._pending_energy: dict[str, list[StatisticData]] = {}
+        # Schedule waiting to be recorded: saved only once every queued
+        # rebuild has succeeded, so a failed one is retried.
+        self._pending_price_signature: str | None = None
         self._prices_store: Store[dict[str, Any]] = Store(
             hass, PRICES_STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.prices"
         )
@@ -259,12 +262,17 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 try:
                     await self._async_rebuild_cost(channel)
                 except Exception:  # noqa: BLE001 - the poll must survive
-                    # The cost rows were dropped, so the regular import
-                    # rebuilds them from the API on the next poll instead.
+                    # The channel stays queued and the schedule stays
+                    # unrecorded, so the next poll clears and rebuilds it
+                    # again instead of leaving a half-priced series behind
+                    # a signature that claims to be up to date.
                     _LOGGER.exception(
                         "Failed to rebuild cost statistics for channel %s",
                         channel,
                     )
+                else:
+                    self._cost_rebuild.discard(channel)
+            await self._async_confirm_prices()
 
         reads = [d for d in reading_times if d is not None]
         last_reading = max(reads) if reads else None
@@ -286,6 +294,32 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.warning("Ignoring invalid price entry: %s", entry)
         return schedules
 
+    async def _async_channels_with_cost(self, channels: list[str]) -> list[str]:
+        """Those of `channels` that already have cost statistics stored."""
+        recorder = get_instance(self.hass)
+        found: list[str] = []
+        for channel in channels:
+            stat_id = f"{self.statistic_id(channel)}_cost"
+            stats = await recorder.async_add_executor_job(
+                get_last_statistics, self.hass, 1, stat_id, True, {"sum"}
+            )
+            if stats.get(stat_id):
+                found.append(channel)
+        return found
+
+    async def _async_confirm_prices(self) -> None:
+        """Record the schedule once every queued rebuild has succeeded.
+
+        Saving drops the "rebuild_owed" flag, which is what tells a later
+        poll that the cost series still needs one.
+        """
+        if self._pending_price_signature is None or self._cost_rebuild:
+            return
+        await self._prices_store.async_save(
+            {"signature": self._pending_price_signature}
+        )
+        self._pending_price_signature = None
+
     async def _async_check_price_changes(self) -> None:
         """Rebuild cost statistics when the tariff schedule was edited.
 
@@ -293,7 +327,21 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         rows imported after the edit. Whenever the schedule changes we drop
         the cost series and rebuild it from the kWh statistics later in
         this poll; the kWh series itself is untouched.
+
+        A schedule that needs no rebuild is recorded here; one that does
+        is recorded by _async_confirm_prices only after the rebuild has
+        actually run, so a poll that dies half way through retries instead
+        of declaring the stale series up to date.
         """
+        if not self.entry.options.get(CONF_IMPORT_STATISTICS, True):
+            # No statistics to keep in step, and recording the schedule now
+            # would hide the rebuild owed once the import is turned back on.
+            return
+        if not self.channels:
+            # Discovery has nothing yet; a rebuild would cover no channel,
+            # and recording the schedule would lose the one owed.
+            return
+
         schedules = self._parse_prices()
         signature = json.dumps(
             {
@@ -307,24 +355,58 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         stored = await self._prices_store.async_load() or {}
         previous = stored.get("signature")
-        if previous == signature:
+        owed = bool(stored.get("rebuild_owed"))
+        if previous == signature and not owed:
             return
 
-        await self._prices_store.async_save({"signature": signature})
-        if previous is None:
-            # First run with this store: nothing is known to be stale.
-            return
+        if owed or previous is not None:
+            # Either the tariffs were edited, or a rebuild queued by an
+            # earlier poll never ran to the end (it raised, or HA was
+            # restarted first). Both mean the whole cost series has to be
+            # rebuilt: the earlier attempt already cleared it, so the
+            # channels that have cost rows are no longer a usable hint.
+            stale = list(self.channels)
+            _LOGGER.info(
+                "WAVIoT %s: %s, rebuilding cost statistics",
+                self.modem_id,
+                "an earlier rebuild is unfinished" if owed else "tariffs changed",
+            )
+        else:
+            # No schedule was ever recorded: either a fresh install, or an
+            # upgrade from a version that priced the whole series with one
+            # flat tariff and stored nothing. Cost rows that already exist
+            # come from that older version, so they hold the old price and
+            # have to be repriced; a channel with no cost rows has nothing
+            # to rebuild. Cost rows of a channel whose price is now gone
+            # are left alone rather than dropped on a guess about what the
+            # older version was told.
+            stale = await self._async_channels_with_cost(
+                [ch for ch in self.channels if ch in schedules]
+            )
+            if not stale:
+                await self._prices_store.async_save({"signature": signature})
+                return
+            _LOGGER.info(
+                "WAVIoT %s: no tariff schedule on record, repricing the "
+                "cost statistics of %s",
+                self.modem_id,
+                ", ".join(stale),
+            )
 
-        _LOGGER.info(
-            "WAVIoT %s: tariffs changed, rebuilding cost statistics",
-            self.modem_id,
+        self._pending_price_signature = signature
+        if not owed:
+            # The debt is recorded before the series is touched, so a
+            # rebuild interrupted by a restart is picked up again. The old
+            # signature is kept as the one the stored rows were built with.
+            await self._prices_store.async_save(
+                {"signature": previous, "rebuild_owed": True}
+            )
+        # Queued on the recorder, so it lands before the rows the rebuild
+        # writes later in this poll.
+        get_instance(self.hass).async_clear_statistics(
+            [f"{self.statistic_id(ch)}_cost" for ch in stale]
         )
-        cost_ids = [f"{self.statistic_id(ch)}_cost" for ch in self.channels]
-        if cost_ids:
-            # Queued on the recorder, so it lands before the rows the
-            # rebuild writes later in this poll.
-            get_instance(self.hass).async_clear_statistics(cost_ids)
-        self._cost_rebuild.update(self.channels)
+        self._cost_rebuild.update(stale)
 
     async def _async_rebuild_cost(self, channel: str) -> None:
         """Recompute one cost series from the kWh statistics.
@@ -333,8 +415,10 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         for as long as the recorder has kept it, so it - not the API - is
         what the new tariffs are applied to: it covers everything ever
         imported, however old, and costs nothing in API calls.
+
+        Returning normally means the channel is done and the caller takes
+        it off the rebuild queue, so raising here asks for a retry.
         """
-        self._cost_rebuild.discard(channel)
         schedule = self._parse_prices().get(channel)
         if not schedule:
             return  # prices removed: the cleared cost series stays gone
