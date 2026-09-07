@@ -385,6 +385,8 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         meta["source"] = STATISTICS_SOURCE
         meta["statistic_id"] = f"{base_id}_cost"
         meta["unit_of_measurement"] = self.hass.config.currency or "RUB"
+        if _UNIT_CLASS_SUPPORTED:
+            meta["unit_class"] = None  # a currency has no unit converter
         async_add_external_statistics(self.hass, StatisticMetaData(**meta), statistics)
         _LOGGER.info(
             "WAVIoT %s: rebuilt %d cost rows for %s (from %s)",
@@ -562,7 +564,10 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             base_meta["source"] = STATISTICS_SOURCE
             base_meta["statistic_id"] = stat_id
             base_meta["unit_of_measurement"] = unit
-            if unit_class is not None and _UNIT_CLASS_SUPPORTED:
+            if _UNIT_CLASS_SUPPORTED:
+                # Always declare it, None included: cores from 2026.11 on
+                # stop deriving it from the unit, and a currency has no
+                # converter to derive it from anyway.
                 base_meta["unit_class"] = unit_class
 
             if tariffs is None and channel in self._cost_rebuild:
