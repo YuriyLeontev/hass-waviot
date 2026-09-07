@@ -22,6 +22,7 @@ CANDIDATE_CHANNELS = [
     "electro_ac_p_lsum_t2",
     "electro_ac_p_lsum_t3",
     "electro_ac_p_lsum_t4",
+    "electro_ac_p_lsum_tsum",
 ]
 
 
@@ -74,10 +75,20 @@ def main() -> int:
             )
             values = data.get("values") or {}
             if values:
-                last_ts = max(int(t) for t in values)
+                stamps = sorted(int(t) for t in values)
+                first_ts, last_ts = stamps[0], stamps[-1]
                 last_val = values[str(last_ts)] if isinstance(values, dict) else None
-                ts_h = time.strftime("%Y-%m-%d %H:%M", time.localtime(last_ts))
-                print(f"  {ch:28s} {len(values):4d} points, last: {last_val} @ {ts_h}")
+                fmt = lambda t: time.strftime("%Y-%m-%d %H:%M", time.localtime(t))
+                span_days = (last_ts - first_ts) / 86400
+                # Median gap tells apart "the server kept N years" from
+                # "the meter has only been reporting for a few months".
+                gaps = sorted(b - a for a, b in zip(stamps, stamps[1:]))
+                step_h = (gaps[len(gaps) // 2] / 3600) if gaps else 0
+                print(f"  {ch:28s} {len(stamps):5d} points, last: {last_val} @ {fmt(last_ts)}")
+                print(
+                    f"  {'':28s} first: {fmt(first_ts)}, span: {span_days:.0f} d, "
+                    f"median step: {step_h:.1f} h"
+                )
             else:
                 print(f"  {ch:28s} no data")
         except Exception as exc:  # noqa: BLE001

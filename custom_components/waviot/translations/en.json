@@ -32,10 +32,17 @@
         "title": "WAVIoT options",
         "data": {
           "channels": "Channels (comma-separated, empty = auto-discover)",
-          "import_statistics": "Import hourly history into long-term statistics",
-          "prices": "Prices (e.g. t1=6.97,t2=3.86)"
+          "prices": "Prices per kWh",
+          "import_statistics": "Import hourly history into long-term statistics"
+        },
+        "data_description": {
+          "channels": "Leave empty unless auto-discovery missed a channel, e.g. electro_ac_p_lsum_t1,electro_ac_p_lsum_t2",
+          "prices": "One price per channel: t1=6.97,t2=3.86. For a tariff change add a dated entry: t1@2026-10-01=7.86 - hours before that date keep the old price. Shortcuts t1..t4, tsum, total expand to channel names; dates are local (2026-10-01 or 01.10.2026). Use ';' between pairs if you write prices with a decimal comma. Editing prices rebuilds the cost statistics over the full stored history."
         }
       }
+    },
+    "error": {
+      "invalid_prices": "Could not parse these price entries: {entries}. Expected key=price or key@date=price, e.g. t1=6.97 or t1@2026-10-01=7.86"
     }
   }
 }

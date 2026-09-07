@@ -31,6 +31,7 @@ from .const import (
     DEFAULT_BASE_URL,
     DOMAIN,
 )
+from .prices import parse_prices
 
 API_KEY_SELECTOR = TextSelector(
     TextSelectorConfig(
@@ -145,10 +146,18 @@ class WaviotOptionsFlow(OptionsFlow):
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        if user_input is not None:
-            return self.async_create_entry(data=user_input)
+        errors: dict[str, str] = {}
+        placeholders: dict[str, str] = {}
 
-        options = self.config_entry.options
+        if user_input is not None:
+            _, bad = parse_prices(user_input.get(CONF_PRICES, ""))
+            if bad:
+                errors[CONF_PRICES] = "invalid_prices"
+                placeholders["entries"] = ", ".join(bad)
+            else:
+                return self.async_create_entry(data=user_input)
+
+        options = {**self.config_entry.options, **(user_input or {})}
         schema = vol.Schema(
             {
                 vol.Optional(
@@ -169,4 +178,9 @@ class WaviotOptionsFlow(OptionsFlow):
                 ): bool,
             }
         )
-        return self.async_show_form(step_id="init", data_schema=schema)
+        return self.async_show_form(
+            step_id="init",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders=placeholders,
+        )
