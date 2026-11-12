@@ -17,8 +17,9 @@ from homeassistant.components.recorder.statistics import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfEnergy
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers.start import async_at_started
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -66,10 +67,19 @@ from .prices import PriceSchedule, cost_series, parse_prices, price_at
 _LOGGER = logging.getLogger(__name__)
 
 PRICES_STORAGE_VERSION = 1
+STATS_STORAGE_VERSION = 1
+# Layout of the stored statistics rows. 1: a reading was filed under the
+# hour it was taken in, which put every hour's consumption one hour late.
+# 2: a reading closes the hour that ends at it (see _reading_hour).
+STATS_LAYOUT = 2
 
 # Start of the window used to re-read the whole kWh series. Statistics are
 # never older than this, and the recorder does not mind a wide range.
 _STATS_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+# How many hours either way the stored rows are compared against the API
+# readings when working out where they sit (see _async_layout_offset).
+_LAYOUT_MAX_OFFSET = 4
 
 
 class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -104,6 +114,13 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._prices_store: Store[dict[str, Any]] = Store(
             hass, PRICES_STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.prices"
         )
+        self._stats_store: Store[dict[str, Any]] = Store(
+            hass, STATS_STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.stats"
+        )
+        self._stats_layout_checked = False
+        # A shift of the stored rows is queued on the recorder but not yet
+        # known to be committed (see _async_align_stats_layout).
+        self._stats_shift_queued = False
 
     # ------------------------------------------------------------------ #
     # Channel discovery
@@ -213,13 +230,10 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self.channels = await self._discover_channels()
             self._channels_discovered = True
 
-        await self._async_check_price_changes()
-
         now = int(datetime.now(tz=timezone.utc).timestamp())
         window_from = now - FETCH_WINDOW_DAYS * 86400
 
-        import_stats = self.entry.options.get(CONF_IMPORT_STATISTICS, True)
-
+        fetched: dict[str, dict[int, float]] = {}
         for channel in self.channels:
             try:
                 values = await self.client.channel_values(
@@ -230,6 +244,7 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await asyncio.sleep(0.5)
                 continue
             await asyncio.sleep(0.5)  # be gentle with the API
+            fetched[channel] = values
 
             if values:
                 last_ts, last_val = max(values.items())
@@ -242,7 +257,15 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 data["channels"][channel] = {"value": None, "ts": None}
 
-            if import_stats:
+        # Statistics are all or nothing for a poll: while the stored rows
+        # are being moved to the current layout nothing may be added to
+        # them or priced from them.
+        if self.entry.options.get(
+            CONF_IMPORT_STATISTICS, True
+        ) and await self._async_align_stats_layout(fetched):
+            await self._async_check_price_changes()
+
+            for channel, values in fetched.items():
                 # Only API trouble is tolerated here: a failing channel must
                 # not kill the poll, but anything else has to surface instead
                 # of being swallowed poll after poll.
@@ -255,7 +278,6 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         err,
                     )
 
-        if import_stats:
             # After the kWh rows of this poll are queued, so the rebuild
             # prices the freshest history available.
             for channel in list(self._cost_rebuild):
@@ -286,6 +308,222 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def statistic_id(self, channel: str) -> str:
         return f"{STATISTICS_SOURCE}:{self.modem_id.lower()}_{channel}"
+
+    def _energy_name(self, channel: str) -> str:
+        return f"WAVIoT {self.modem_id} {CHANNEL_NAMES.get(channel, channel)}"
+
+    async def _async_align_stats_layout(
+        self, fetched: dict[str, dict[int, float]]
+    ) -> bool:
+        """Move rows stored by older versions to the current layout, once.
+
+        Older versions filed the reading taken at 08:00 under the 08:00
+        row, which HA shows as 08:00-09:00, although it closes the hour
+        07:00-08:00. New rows are filed correctly (see _reading_hour); the
+        ones already stored are shifted here so the series stays in one
+        piece. The cost series is then rebuilt from the shifted kWh rows
+        by the regular tariff-change path.
+
+        Where the stored rows sit is measured against the API readings
+        rather than assumed: 1.1.3 could shift them and then be cancelled
+        before recording that it had, so "no layout on record" does not
+        prove the rows are still on the old hours.
+
+        Returns False while the statistics must be left alone for this
+        poll. The recorder only starts working through its queue once
+        Home Assistant has started, so waiting for it during setup would
+        hang the startup; a shift queued that early is confirmed by the
+        poll requested for the moment HA is up.
+        """
+        if self._stats_layout_checked:
+            return True
+        if not self.channels:
+            return False
+        recorder = get_instance(self.hass)
+
+        if not self._stats_shift_queued:
+            stored = await self._stats_store.async_load() or {}
+            if stored.get("layout", 1) >= STATS_LAYOUT:
+                self._stats_layout_checked = True
+                return True
+
+            offset = await self._async_layout_offset(fetched)
+            if offset is None:
+                _LOGGER.debug(
+                    "WAVIoT %s: not enough readings to tell how the stored "
+                    "statistics are laid out, leaving them for the next poll",
+                    self.modem_id,
+                )
+                return False
+            if offset and await self._async_shift_stats(offset):
+                self._stats_shift_queued = True
+
+        if self._stats_shift_queued:
+            if not self.hass.is_running:
+                self.entry.async_on_unload(
+                    async_at_started(self.hass, self._async_refresh_at_start)
+                )
+                return False
+            # The import reads the last stored row, so the shifted rows
+            # have to be committed first.
+            await recorder.async_block_till_done()
+            self._stats_shift_queued = False
+
+        await self._stats_store.async_save({"layout": STATS_LAYOUT})
+        self._stats_layout_checked = True
+        return True
+
+    @callback
+    def _async_refresh_at_start(self, hass: HomeAssistant) -> None:
+        """Finish the statistics work put off until HA was up."""
+        if self._stats_shift_queued:
+            hass.async_create_task(self.async_request_refresh())
+
+    async def _async_layout_offset(
+        self, fetched: dict[str, dict[int, float]]
+    ) -> int | None:
+        """How many hours after their proper place the stored rows sit.
+
+        0 is the current layout, 1 the one of older versions. The rows of
+        the fetch window are compared with the readings they were made
+        from, at every offset in reach; all channels vote together, since
+        they were always written and moved together. Only readings whose
+        value occurs once count - an hour without consumption repeats the
+        value and would match at several offsets.
+
+        None means there are stored rows but nothing to judge them by.
+        """
+        recorder = get_instance(self.hass)
+        offsets = range(-_LAYOUT_MAX_OFFSET, _LAYOUT_MAX_OFFSET + 1)
+        scores = dict.fromkeys(offsets, 0)
+        any_stored = False
+
+        for channel in self.channels:
+            base_id = self.statistic_id(channel)
+            expected: dict[datetime, float] = {}
+            for ts, val in sorted((fetched.get(channel) or {}).items()):
+                expected[_reading_hour(ts)] = val
+            if not expected:
+                last = await recorder.async_add_executor_job(
+                    get_last_statistics, self.hass, 1, base_id, True, {"sum"}
+                )
+                any_stored = any_stored or bool(last.get(base_id))
+                continue
+
+            period = await recorder.async_add_executor_job(
+                partial(
+                    statistics_during_period,
+                    self.hass,
+                    min(expected) - timedelta(hours=_LAYOUT_MAX_OFFSET),
+                    None,
+                    statistic_ids={base_id},
+                    period="hour",
+                    units=None,
+                    types={"state"},
+                )
+            )
+            stored = {
+                _stat_row_start(row): row["state"]
+                for row in period.get(base_id) or []
+                if row.get("state") is not None
+            }
+            if not stored:
+                last = await recorder.async_add_executor_job(
+                    get_last_statistics, self.hass, 1, base_id, True, {"sum"}
+                )
+                any_stored = any_stored or bool(last.get(base_id))
+                continue
+            any_stored = True
+
+            seen: dict[float, int] = {}
+            for val in expected.values():
+                seen[val] = seen.get(val, 0) + 1
+            for hour, val in expected.items():
+                if seen[val] != 1:
+                    continue
+                for offset in offsets:
+                    state = stored.get(hour + timedelta(hours=offset))
+                    if state is not None and abs(state - val) < 1e-6:
+                        scores[offset] += 1
+
+        if not any_stored:
+            return 0  # nothing imported yet, nothing to move
+        ranked = sorted(scores.items(), key=lambda item: item[1], reverse=True)
+        if ranked[0][1] == 0 or ranked[0][1] == ranked[1][1]:
+            return None
+        _LOGGER.debug(
+            "WAVIoT %s: stored statistics sit %+d h from their place (%s)",
+            self.modem_id,
+            ranked[0][0],
+            scores,
+        )
+        return ranked[0][0]
+
+    async def _async_shift_stats(self, offset: int) -> bool:
+        """Queue moving every kWh series `offset` hours back.
+
+        Returns whether anything was queued.
+        """
+        recorder = get_instance(self.hass)
+        # Read everything before touching anything: a failed read must not
+        # leave some channels shifted and others not.
+        shifted: dict[str, list[StatisticData]] = {}
+        for channel in self.channels:
+            base_id = self.statistic_id(channel)
+            period = await recorder.async_add_executor_job(
+                partial(
+                    statistics_during_period,
+                    self.hass,
+                    _STATS_EPOCH,
+                    None,
+                    statistic_ids={base_id},
+                    period="hour",
+                    units=None,
+                    types={"state", "sum"},
+                )
+            )
+            rows = [
+                StatisticData(
+                    start=_stat_row_start(row) - timedelta(hours=offset),
+                    state=row.get("state"),
+                    sum=row["sum"],
+                )
+                for row in period.get(base_id) or []
+                if row.get("sum") is not None
+            ]
+            if rows:
+                shifted[channel] = rows
+        if not shifted:
+            return False
+
+        # The cost rows sit on the old hours too; flag them for the
+        # rebuild that _async_check_price_changes runs. Recorded before
+        # the rows are touched, so an interrupted move still gets it.
+        prices = await self._prices_store.async_load() or {}
+        await self._prices_store.async_save(
+            {"signature": prices.get("signature"), "rebuild_owed": True}
+        )
+        for channel, rows in shifted.items():
+            base_id = self.statistic_id(channel)
+            # Both are queued on the recorder, in this order.
+            recorder.async_clear_statistics([base_id])
+            async_add_external_statistics(
+                self.hass,
+                _statistic_metadata(
+                    base_id,
+                    self._energy_name(channel),
+                    UnitOfEnergy.KILO_WATT_HOUR,
+                    "energy",
+                ),
+                rows,
+            )
+        _LOGGER.info(
+            "WAVIoT %s: moving the statistics of %s %d h back",
+            self.modem_id,
+            ", ".join(shifted),
+            offset,
+        )
+        return True
 
     def _parse_prices(self) -> dict[str, PriceSchedule]:
         """Tariff schedules from the prices option, bad entries skipped."""
@@ -333,10 +571,6 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         actually run, so a poll that dies half way through retries instead
         of declaring the stale series up to date.
         """
-        if not self.entry.options.get(CONF_IMPORT_STATISTICS, True):
-            # No statistics to keep in step, and recording the schedule now
-            # would hide the rebuild owed once the import is turned back on.
-            return
         if not self.channels:
             # Discovery has nothing yet; a rebuild would cover no channel,
             # and recording the schedule would lose the one owed.
@@ -462,16 +696,16 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             StatisticData(start=hour, state=state, sum=total)
             for hour, state, total in priced
         ]
-        name = f"WAVIoT {self.modem_id} {CHANNEL_NAMES.get(channel, channel)} cost"
-        meta: dict = dict(_MEAN_KWARGS)
-        meta["has_sum"] = True
-        meta["name"] = name
-        meta["source"] = STATISTICS_SOURCE
-        meta["statistic_id"] = f"{base_id}_cost"
-        meta["unit_of_measurement"] = self.hass.config.currency or "RUB"
-        if _UNIT_CLASS_SUPPORTED:
-            meta["unit_class"] = None  # a currency has no unit converter
-        async_add_external_statistics(self.hass, StatisticMetaData(**meta), statistics)
+        async_add_external_statistics(
+            self.hass,
+            _statistic_metadata(
+                f"{base_id}_cost",
+                f"{self._energy_name(channel)} cost",
+                self.hass.config.currency or "RUB",
+                None,  # a currency has no unit converter
+            ),
+            statistics,
+        )
         _LOGGER.info(
             "WAVIoT %s: rebuilt %d cost rows for %s (from %s)",
             self.modem_id,
@@ -557,7 +791,7 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     ) -> None:
         """Import energy (kWh) and, if a price is set, cost statistics."""
         base_id = self.statistic_id(channel)
-        base_name = f"WAVIoT {self.modem_id} {CHANNEL_NAMES.get(channel, channel)}"
+        base_name = self._energy_name(channel)
         schedule = self._parse_prices().get(channel)
 
         # (statistic_id, name, unit, unit_class, tariffs) - tariffs is None
@@ -596,13 +830,11 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 values = {**history, **recent_values}
                 self._stats_backfilled.add(channel)
 
-        # Collapse readings to one per hour (last reading inside the hour).
+        # Collapse readings to one per hour: the last reading of the hour
+        # it closes.
         hourly: dict[datetime, float] = {}
         for ts, val in sorted(values.items()):
-            hour = datetime.fromtimestamp(ts, tz=timezone.utc).replace(
-                minute=0, second=0, microsecond=0
-            )
-            hourly[hour] = val
+            hourly[_reading_hour(ts)] = val
         if not hourly:
             return
 
@@ -642,28 +874,51 @@ class WaviotCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if not statistics:
                 continue
 
-            base_meta: dict = dict(_MEAN_KWARGS)
-            base_meta["has_sum"] = True
-            base_meta["name"] = name
-            base_meta["source"] = STATISTICS_SOURCE
-            base_meta["statistic_id"] = stat_id
-            base_meta["unit_of_measurement"] = unit
-            if _UNIT_CLASS_SUPPORTED:
-                # Always declare it, None included: cores from 2026.11 on
-                # stop deriving it from the unit, and a currency has no
-                # converter to derive it from anyway.
-                base_meta["unit_class"] = unit_class
-
             if tariffs is None and channel in self._cost_rebuild:
                 # The rebuild reads the kWh series back from the recorder,
                 # which may not have committed these rows yet.
                 self._pending_energy[channel] = list(statistics)
 
-            metadata = StatisticMetaData(**base_meta)
-            async_add_external_statistics(self.hass, metadata, statistics)
+            async_add_external_statistics(
+                self.hass,
+                _statistic_metadata(stat_id, name, unit, unit_class),
+                statistics,
+            )
             _LOGGER.debug(
                 "Imported %d statistic rows for %s", len(statistics), stat_id
             )
+
+
+def _reading_hour(ts: int) -> datetime:
+    """Start of the statistics hour a meter reading belongs to.
+
+    A cumulative reading taken at 08:00 is the total at the end of the
+    hour 07:00-08:00, and HA labels a row by the start of its hour with
+    the sum reached at its end - so that reading is the 07:00 row. Filing
+    it under 08:00 would show every hour's consumption one hour late.
+
+    Readings are not stamped exactly on the hour, so the hour boundary a
+    reading closes is the nearest one: 07:59:58 and 08:00:07 both close
+    07:00-08:00.
+    """
+    return datetime.fromtimestamp((ts - 1800) // 3600 * 3600, tz=timezone.utc)
+
+
+def _statistic_metadata(
+    stat_id: str, name: str, unit: str, unit_class: str | None
+) -> StatisticMetaData:
+    meta: dict = dict(_MEAN_KWARGS)
+    meta["has_sum"] = True
+    meta["name"] = name
+    meta["source"] = STATISTICS_SOURCE
+    meta["statistic_id"] = stat_id
+    meta["unit_of_measurement"] = unit
+    if _UNIT_CLASS_SUPPORTED:
+        # Always declare it, None included: cores from 2026.11 on stop
+        # deriving it from the unit, and a currency has no converter to
+        # derive it from anyway.
+        meta["unit_class"] = unit_class
+    return StatisticMetaData(**meta)
 
 
 def _stat_row_start(row: Any) -> datetime:

@@ -15,7 +15,11 @@ from .const import (
     DEFAULT_BASE_URL,
     DOMAIN,
 )
-from .coordinator import PRICES_STORAGE_VERSION, WaviotCoordinator
+from .coordinator import (
+    PRICES_STORAGE_VERSION,
+    STATS_STORAGE_VERSION,
+    WaviotCoordinator,
+)
 
 PLATFORMS: list[Platform] = [Platform.SENSOR]
 
@@ -50,7 +54,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: WaviotConfigEntry) -> b
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: WaviotConfigEntry) -> None:
-    """Drop the stored tariff signature along with the entry."""
+    """Drop the stored tariff signature and layout along with the entry."""
     await Store(
         hass, PRICES_STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.prices"
+    ).async_remove()
+    await Store(
+        hass, STATS_STORAGE_VERSION, f"{DOMAIN}.{entry.entry_id}.stats"
     ).async_remove()
